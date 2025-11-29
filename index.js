@@ -1,120 +1,179 @@
+// index.js
 import express from "express";
-import bodyParser from "body-parser";
 import { BigQuery } from "@google-cloud/bigquery";
+import crypto from "crypto";
 
 const app = express();
 
-// Accept raw JSON from Shopify
-app.use(bodyParser.json({ type: "*/*" }));
+// Capture the raw body for HMAC verification
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
 
-// BigQuery client
 const bigquery = new BigQuery();
+
+const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.PROJECT_ID;
 const DATASET_ID = "retail_mvp";
-
-// Order-level table
 const ORDERS_TABLE_ID = "events_orders";
-
-// Product-level table (already created in your project)
 const PRODUCTS_TABLE_ID = "events_v4_product_metrics_table";
 
-// Utility: safe numeric string for BigQuery NUMERIC
-function toNumericString(value) {
-  if (value === null || value === undefined || value === "") return "0";
-  // Shopify often sends numeric fields as strings
-  return String(value);
-}
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
-// Insert rows helper
-async function insertRows(tableId, rows) {
-  if (!rows || rows.length === 0) return;
+// ---- Shopify HMAC verification ----
+function verifyShopifyHmac(req) {
+  if (!SHOPIFY_WEBHOOK_SECRET) {
+    console.warn(
+      "SHOPIFY_WEBHOOK_SECRET is not set. Skipping HMAC validation (DEV ONLY)."
+    );
+    return true; // for safety, you can change this to false once secret is set
+  }
 
-  const table = bigquery.dataset(DATASET_ID).table(tableId);
+  const hmacHeader = req.get("X-Shopify-Hmac-Sha256") || "";
+  const rawBody = req.rawBody || "";
 
-  await table.insert(rows);
-  console.log(
-    `Inserted ${rows.length} row(s) into ${DATASET_ID}.${tableId}`
-  );
-}
+  const generatedHash = crypto
+    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+    .update(rawBody, "utf8")
+    .digest("base64");
 
-// Basic health check
-app.get("/", (req, res) => {
-  res.status(200).send("shopify-webhook-handler is running");
-});
+  const hashBuffer = Buffer.from(generatedHash, "utf8");
+  const headerBuffer = Buffer.from(hmacHeader, "utf8");
 
-// Shopify orders/create webhook
-app.post("/", async (req, res) => {
+  if (hashBuffer.length !== headerBuffer.length) {
+    return false;
+  }
+
   try {
+    return crypto.timingSafeEqual(hashBuffer, headerBuffer);
+  } catch (e) {
+    console.error("Error comparing HMAC:", e);
+    return false;
+  }
+}
+
+// ---- Helper: BigQuery insert with simple retry ----
+async function insertWithRetry(table, rows, label) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await table.insert(rows);
+      console.log(
+        `Inserted ${rows.length} row(s) into ${DATASET_ID}.${table.id} (${label})`
+      );
+      return;
+    } catch (err) {
+      console.error(
+        `Attempt ${attempt} failed inserting into ${DATASET_ID}.${table.id} (${label}):`,
+        err
+      );
+      if (attempt === maxAttempts) {
+        throw err;
+      }
+    }
+  }
+}
+
+// ---- Webhook endpoint ----
+app.post("/", async (req, res) => {
+  const start = Date.now();
+
+  try {
+    // 1) HMAC verification
+    if (!verifyShopifyHmac(req)) {
+      console.warn("Invalid Shopify HMAC. Rejecting webhook.");
+      return res.status(401).send("Invalid signature");
+    }
+
     const order = req.body;
 
     if (!order || !order.id || !Array.isArray(order.line_items)) {
-      console.error("Invalid payload", JSON.stringify(order).slice(0, 500));
+      console.warn("Invalid payload:", order);
       return res.status(400).send("Invalid payload");
     }
 
-    console.log(`Received order ${order.id} with ${order.line_items.length} items`);
+    const orderId = order.id.toString();
+    console.log(
+      `Received order ${orderId} with ${order.line_items.length} line items`
+    );
 
-    // -------------------------
-    // 1) Build order-level row
-    // -------------------------
-    const occurredAt = order.created_at
-      ? new Date(order.created_at)
-      : new Date();
+    const dataset = bigquery.dataset(DATASET_ID);
+    const ordersTable = dataset.table(ORDERS_TABLE_ID);
+    const productsTable = dataset.table(PRODUCTS_TABLE_ID);
 
-    // You can adjust how shop_id is derived; for now, use shop's domain fallback:
-    const shopId =
-      order.location_id?.toString() ||
-      order.source_name ||
-      "DEMO_SHOP";
+    // 2) Idempotency: has this order already been processed?
+    const [checkRows] = await bigquery.query({
+      query: `
+        SELECT 1
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${ORDERS_TABLE_ID}\`
+        WHERE order_id = @orderId
+        LIMIT 1
+      `,
+      params: { orderId },
+    });
 
+    if (checkRows.length > 0) {
+      console.log(
+        `Order ${orderId} already processed earlier. Skipping inserts and returning 200.`
+      );
+      return res.status(200).send("Already processed");
+    }
+
+    // 3) Prepare common fields
+    const occurred_at = order.created_at || new Date().toISOString();
+    const shop_id = order?.source_name || "SHOPIFY";
+    const currency = order.currency || "USD";
+    const source = "shopify_webhook";
+
+    // 4) Prepare order-level row
     const orderRow = {
-      order_id: order.id.toString(),
-      occurred_at: occurredAt,
-      shop_id: shopId,
-      total_price: toNumericString(order.total_price),
-      subtotal_price: toNumericString(order.subtotal_price),
-      total_tax: toNumericString(order.total_tax),
-      total_discounts: toNumericString(order.total_discounts),
-      currency: order.currency || "USD",
-      source: "shopify_webhook"
+      order_id: orderId,
+      occurred_at,
+      shop_id,
+      total_price: parseFloat(order.total_price || 0),
+      total_discount: parseFloat(order.total_discounts || 0),
+      currency,
+      source,
     };
 
-    // --------------------------
-    // 2) Build product-level rows
-    // --------------------------
+    // 5) Prepare product-level rows
     const productRows = order.line_items.map((item) => ({
-      order_id: order.id.toString(),
-      occurred_at: occurredAt,
-      shop_id: shopId,
+      order_id: orderId,
+      occurred_at,
+      shop_id,
       product_id: item.product_id ? item.product_id.toString() : null,
       product_title: item.title || null,
       variant_id: item.variant_id ? item.variant_id.toString() : null,
       variant_title: item.variant_title || null,
       quantity: item.quantity || 0,
-      price: toNumericString(item.price),
-      total_discount: toNumericString(item.total_discount),
+      price: parseFloat(item.price || 0),
+      total_discount: parseFloat(item.total_discount || 0),
       vendor: item.vendor || null,
-      currency: order.currency || "USD",
-      source: "shopify_webhook"
+      currency,
+      source,
     }));
 
-    // --------------------------
-    // 3) Insert into BigQuery
-    // --------------------------
-    await insertRows(ORDERS_TABLE_ID, [orderRow]);
-    await insertRows(PRODUCTS_TABLE_ID, productRows);
+    // 6) Write to BigQuery with retries
+    await insertWithRetry(ordersTable, [orderRow], "orders");
+    await insertWithRetry(productsTable, productRows, "product_metrics");
 
+    const durationMs = Date.now() - start;
     console.log(
-      `Order ${order.id} stored: 1 order row, ${productRows.length} product rows`
+      `Order ${orderId} stored successfully: 1 order row, ${productRows.length} product rows in ${durationMs} ms`
     );
 
-    res.status(200).send("OK");
+    return res.status(200).send("OK");
   } catch (err) {
-    console.error("Error handling Shopify webhook", err);
-    res.status(500).send("Internal server error");
+    console.error("Unhandled error while processing webhook:", err);
+    // Returning 500 lets Shopify retry later; idempotency will protect us.
+    return res.status(500).send("Internal error");
   }
 });
 
-// Start server
+// ---- Start server ----
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`shopify-webhook-handler listening on port ${PORT}`);
